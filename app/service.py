@@ -86,6 +86,28 @@ def _descendants(
     return order
 
 
+def _walk_depths(adj: dict[str, list[str]], start: str) -> dict[str, int]:
+    """从 start 沿邻接方向 BFS,返回 {可达节点: 最短跳数}(不含 start)。
+
+    按完整样品编号判定是否已访问:真环路不会无限展开,编号互为子串/后缀的
+    不同样品也不会被误剪;分叉、合流路径上的节点全部可达,合流节点只入队
+    扩展一次,深度为最短跳数。
+    """
+    depths: dict[str, int] = {start: 0}
+    queue = [start]
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        for nxt in adj.get(node, ()):
+            if nxt in depths:  # 已访问(含 start):合流/成环不再重复扩展
+                continue
+            depths[nxt] = depths[node] + 1
+            queue.append(nxt)
+    del depths[start]
+    return depths
+
+
 # ---------------------------------------------------------------- 幂等
 
 def canonical_payload(op: s.AnyOp) -> str:
@@ -709,44 +731,24 @@ def trace_sample(
                       sample_id=sample_id)
         ])
 
-    # 递归 CTE:沿谱系边向上找来源 / 向下找去向,path 用于破除环
+    # 沿谱系边向上找来源 / 向下找去向:按完整样品编号做 BFS(不再用路径
+    # 字符串子串判环,避免 A→B→AA→C 这类编号后缀重合时误剪祖先/后代);
+    # 已访问集合防止真环路无限展开,合流节点只扩展一次,深度取最短跳数。
+    pairs = _load_edges(conn)
+    by_parent: dict[str, list[str]] = {}
+    by_child: dict[str, list[str]] = {}
+    for par, ch in pairs:
+        by_parent.setdefault(par, []).append(ch)
+        by_child.setdefault(ch, []).append(par)
+
     nodes: dict[str, int] = {sample_id: 0}
     if direction in ("upstream", "both"):
-        rows = conn.execute(
-            """
-            WITH RECURSIVE walk(node, depth, path) AS (
-                SELECT parent_id, 1, '/' || child_id || '/'
-                  FROM lineage_edges WHERE child_id = ? AND parent_id IS NOT NULL
-                UNION
-                SELECT e.parent_id, w.depth + 1, w.path || e.child_id || '/'
-                  FROM lineage_edges e JOIN walk w ON e.child_id = w.node
-                 WHERE e.parent_id IS NOT NULL
-                   AND instr(w.path, e.parent_id || '/') = 0
-            )
-            SELECT node, MIN(depth) AS depth FROM walk GROUP BY node
-            """,
-            (sample_id,),
-        ).fetchall()
-        for r in rows:
-            nodes[r["node"]] = max(nodes.get(r["node"], -1), r["depth"])
+        for nid, d in _walk_depths(by_child, sample_id).items():
+            # 向上/向下都可达时(合流),记较小跳数;目标样品保持 0
+            nodes[nid] = min(nodes.get(nid, d), d)
     if direction in ("downstream", "both"):
-        rows = conn.execute(
-            """
-            WITH RECURSIVE walk(node, depth, path) AS (
-                SELECT child_id, 1, '/' || parent_id || '/'
-                  FROM lineage_edges WHERE parent_id = ?
-                UNION
-                SELECT e.child_id, w.depth + 1, w.path || e.parent_id || '/'
-                  FROM lineage_edges e JOIN walk w ON e.parent_id = w.node
-                 WHERE instr(w.path, e.child_id || '/') = 0
-            )
-            SELECT node, MIN(depth) AS depth FROM walk GROUP BY node
-            """,
-            (sample_id,),
-        ).fetchall()
-        for r in rows:
-            # 向上/向下都可达时(合流),记较小跳数
-            nodes[r["node"]] = min(nodes.get(r["node"], r["depth"]), r["depth"])
+        for nid, d in _walk_depths(by_parent, sample_id).items():
+            nodes[nid] = min(nodes.get(nid, d), d)
 
     ids = list(nodes.keys())
     if not ids:

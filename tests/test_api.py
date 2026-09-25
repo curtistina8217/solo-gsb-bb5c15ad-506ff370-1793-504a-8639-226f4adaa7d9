@@ -321,6 +321,67 @@ def test_trace_upstream_downstream_and_balance(client):
     assert r.json()["conflicts"][0]["code"] == "sample_not_found"
 
 
+def test_trace_upstream_with_suffix_colliding_ids(client):
+    # A -> B -> AA -> C:编号后缀重合(A 是 AA 的子串),按完整编号判环,
+    # 查询 C 的 upstream 不得漏掉 A(根样品、谱系边与关联操作都要在)
+    client.post("/api/v1/operations/sampling", json={
+        "type": "sampling", "op_no": "SC1", "sample_id": "A",
+        "material": "M", "amount": 100, "unit": "mg"})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "SC2", "parent_id": "A",
+        "outputs": [{"sample_id": "B", "amount": 50}]})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "SC3", "parent_id": "B",
+        "outputs": [{"sample_id": "AA", "amount": 20}]})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "SC4", "parent_id": "AA",
+        "outputs": [{"sample_id": "C", "amount": 10}]})
+
+    up = client.get("/api/v1/samples/C/trace?direction=upstream").json()
+    node_ids = {n["sample_id"]: n["depth"] for n in up["nodes"]}
+    assert node_ids == {"C": 0, "AA": 1, "B": 2, "A": 3}
+    assert up["roots"] == ["A"]
+    edge_pairs = {(e["parent_id"], e["child_id"]) for e in up["edges"]}
+    assert edge_pairs == {(None, "A"), ("A", "B"), ("B", "AA"), ("AA", "C")}
+    op_nos = {o["op_no"] for o in up["operations"]}
+    assert {"SC1", "SC2", "SC3", "SC4"} <= op_nos
+
+    # 反向:查询 A 的 downstream 也不得漏掉后缀重合的 AA
+    down = client.get("/api/v1/samples/A/trace?direction=downstream").json()
+    node_ids = {n["sample_id"]: n["depth"] for n in down["nodes"]}
+    assert node_ids == {"A": 0, "B": 1, "AA": 2, "C": 3}
+    assert down["leaves"] == ["C"]
+
+
+def test_trace_fork_and_confluence_expands_once(client):
+    # 分叉 + 合流:R -> P, R -> Q, P/Q -> M, M -> Z;合流节点只扩展一次,
+    # 深度取最短跳数,全部可达节点与边都返回
+    client.post("/api/v1/operations/sampling", json={
+        "type": "sampling", "op_no": "FC1", "sample_id": "R",
+        "material": "M", "amount": 100, "unit": "mg"})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "FC2", "parent_id": "R",
+        "outputs": [{"sample_id": "P", "amount": 30},
+                    {"sample_id": "Q", "amount": 30}]})
+    client.post("/api/v1/operations/merge", json={
+        "type": "merge", "op_no": "FC3",
+        "inputs": [{"sample_id": "P", "amount": 10},
+                   {"sample_id": "Q", "amount": 10}],
+        "output_id": "M", "material": "M"})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "FC4", "parent_id": "M",
+        "outputs": [{"sample_id": "Z", "amount": 5}]})
+
+    both = client.get("/api/v1/samples/M/trace").json()
+    node_ids = {n["sample_id"]: n["depth"] for n in both["nodes"]}
+    assert node_ids == {"M": 0, "P": 1, "Q": 1, "R": 2, "Z": 1}
+    assert both["roots"] == ["R"]
+    assert both["leaves"] == ["Z"]
+    edge_pairs = {(e["parent_id"], e["child_id"]) for e in both["edges"]}
+    assert edge_pairs == {(None, "R"), ("R", "P"), ("R", "Q"),
+                          ("P", "M"), ("Q", "M"), ("M", "Z")}
+
+
 def test_merge_into_existing_sample(client):
     client.post("/api/v1/operations/sampling", json={
         "type": "sampling", "op_no": "E1", "sample_id": "E-a",
