@@ -314,7 +314,33 @@ curl "http://localhost:8000/api/v1/samples/B1/trace?direction=upstream"
 curl "http://localhost:8000/api/v1/samples/S0/trace?direction=downstream"
 ```
 
-响应同时包含 `nodes`(样品及跳数)、`edges`(带操作号的谱系边)、`operations`(相关操作与时间/位置)、`roots`、`leaves`。遍历用递归 CTE 并带路径防环保护。
+响应同时包含 `nodes`(样品及跳数)、`edges`(带操作号的谱系边)、`operations`(相关操作与时间/位置)、`roots`、`leaves`。遍历按**完整样品编号**做 BFS:已访问集合防止真环路无限展开,分叉/合流路径上的节点全部可达,合流节点只扩展一次,深度取最短跳数。
+
+**编号后缀重合不会误剪**:谱系 `A → B → AA → C` 中 `A` 是 `AA` 的子串,但回溯按完整编号识别节点,查询 `C` 的来源仍返回包含根样品 `A` 的完整链:
+
+```bash
+# A 取样 100 mL 后逐级分装:A -> B(50) -> AA(20) -> C(10)
+curl -X POST http://localhost:8000/api/v1/operations/sampling \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "sampling", "op_no": "OP-101", "sample_id": "A",
+       "material": "血清", "amount": 100, "unit": "mL"}'
+curl -X POST http://localhost:8000/api/v1/operations/aliquot \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "aliquot", "op_no": "OP-102", "parent_id": "A",
+       "outputs": [{"sample_id": "B", "amount": 50}]}'
+curl -X POST http://localhost:8000/api/v1/operations/aliquot \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "aliquot", "op_no": "OP-103", "parent_id": "B",
+       "outputs": [{"sample_id": "AA", "amount": 20}]}'
+curl -X POST http://localhost:8000/api/v1/operations/aliquot \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "aliquot", "op_no": "OP-104", "parent_id": "AA",
+       "outputs": [{"sample_id": "C", "amount": 10}]}'
+
+# C 的 upstream:节点 C(0) / AA(1) / B(2) / A(3),roots=["A"],
+# edges 含 A->B、B->AA、AA->C 与取样源边,operations 含 OP-101~OP-104
+curl "http://localhost:8000/api/v1/samples/C/trace?direction=upstream"
+```
 
 ### 6. 余量账本校验
 
@@ -1070,7 +1096,7 @@ app/
   init_db.py       # 命令行幂等建表/迁移(容器入口先于 API 启动执行)
   db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留/核销/盘点/销毁/位置交接/冲正/条码换绑/冷链测温/召回表)
   schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留、核销领用、盘点、销毁、位置交接与整单冲正、条码换绑、冷链测温、样品召回模型)
-  service.py       # 核心:事务提交、余量/可用量/环路校验、销毁审计、幂等回放、dry-run、递归回溯、账本审计
+  service.py       # 核心:事务提交、余量/可用量/环路校验、销毁审计、幂等回放、dry-run、谱系回溯(BFS)、账本审计
   reservations.py  # 预留:单事务多样品锁定、幂等重放、整单释放、可用量查询、事件审计(锁定量只计未核销部分)
   consumptions.py  # 核销领用:单事务校验预留未释放/逐项未核销量/样品余量/活跃召回,扣减余量、递增版本、不可变明细,幂等重放
   recalls.py       # 样品召回:召回号开启(源样品+原因)/按号关闭/幂等,实时沿谱系边追踪源样品及全部后代(合并路径只计一次),受影响样品查询,核销逐项召回拦截

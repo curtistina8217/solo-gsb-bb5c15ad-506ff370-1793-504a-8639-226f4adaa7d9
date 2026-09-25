@@ -321,6 +321,86 @@ def test_trace_upstream_downstream_and_balance(client):
     assert r.json()["conflicts"][0]["code"] == "sample_not_found"
 
 
+def test_trace_sample_id_suffix_collision(client):
+    # 编号后缀重合:A -> B -> AA -> C;按子串判环会把 A 误当 AA 剪掉,
+    # 查询 C 的 upstream 必须返回完整链(含根样品 A 与全部关联操作)
+    client.post("/api/v1/operations/sampling", json={
+        "type": "sampling", "op_no": "N1", "sample_id": "A",
+        "material": "M", "amount": 100, "unit": "mL"})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "N2", "parent_id": "A",
+        "outputs": [{"sample_id": "B", "amount": 50}]})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "N3", "parent_id": "B",
+        "outputs": [{"sample_id": "AA", "amount": 20}]})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "N4", "parent_id": "AA",
+        "outputs": [{"sample_id": "C", "amount": 10}]})
+
+    up = client.get("/api/v1/samples/C/trace?direction=upstream").json()
+    node_ids = {n["sample_id"]: n["depth"] for n in up["nodes"]}
+    assert node_ids == {"C": 0, "AA": 1, "B": 2, "A": 3}
+    assert up["roots"] == ["A"]
+    edge_pairs = {(e["parent_id"], e["child_id"]) for e in up["edges"]}
+    assert ("A", "B") in edge_pairs
+    assert ("B", "AA") in edge_pairs
+    assert ("AA", "C") in edge_pairs
+    op_nos = {o["op_no"] for o in up["operations"]}
+    assert {"N1", "N2", "N3", "N4"} <= op_nos
+
+    # 反向:查询 A 的 downstream 同样不被后缀重合截断
+    down = client.get("/api/v1/samples/A/trace?direction=downstream").json()
+    node_ids = {n["sample_id"]: n["depth"] for n in down["nodes"]}
+    assert node_ids == {"A": 0, "B": 1, "AA": 2, "C": 3}
+    assert down["leaves"] == ["C"]
+
+
+def test_trace_fork_and_confluence(client):
+    # 分叉+合流:R1/R2 -> M -> D1/D2 -> J,全部可达节点与边都返回,
+    # 深度取最短跳数,合流节点只出现一次
+    client.post("/api/v1/operations/sampling", json={
+        "type": "sampling", "op_no": "F1", "sample_id": "R1",
+        "material": "M", "amount": 100, "unit": "mL"})
+    client.post("/api/v1/operations/sampling", json={
+        "type": "sampling", "op_no": "F2", "sample_id": "R2",
+        "material": "M", "amount": 100, "unit": "mL"})
+    client.post("/api/v1/operations/merge", json={
+        "type": "merge", "op_no": "F3",
+        "inputs": [{"sample_id": "R1", "amount": 50},
+                   {"sample_id": "R2", "amount": 50}],
+        "output_id": "M", "material": "M"})
+    client.post("/api/v1/operations/aliquot", json={
+        "type": "aliquot", "op_no": "F4", "parent_id": "M",
+        "outputs": [{"sample_id": "D1", "amount": 40},
+                    {"sample_id": "D2", "amount": 40}]})
+    client.post("/api/v1/operations/merge", json={
+        "type": "merge", "op_no": "F5",
+        "inputs": [{"sample_id": "D1", "amount": 30},
+                   {"sample_id": "D2", "amount": 30}],
+        "output_id": "J", "material": "M"})
+
+    up = client.get("/api/v1/samples/J/trace?direction=upstream").json()
+    node_ids = {n["sample_id"]: n["depth"] for n in up["nodes"]}
+    assert node_ids == {"J": 0, "D1": 1, "D2": 1, "M": 2, "R1": 3, "R2": 3}
+    assert set(up["roots"]) == {"R1", "R2"}
+    # 6 条谱系边 + R1/R2 两条取样源边(parent=null)
+    assert len(up["edges"]) == 8
+    assert len({(e["parent_id"], e["child_id"], e["op_no"])
+                for e in up["edges"]}) == 8
+
+    down = client.get("/api/v1/samples/R1/trace?direction=downstream").json()
+    node_ids = {n["sample_id"]: n["depth"] for n in down["nodes"]}
+    # 合流节点 J 只计一次,深度为最短跳数(经 D1 或 D2 均为 3)
+    assert node_ids == {"R1": 0, "M": 1, "D1": 2, "D2": 2, "J": 3}
+    assert down["leaves"] == ["J"]
+
+    both = client.get("/api/v1/samples/M/trace").json()
+    node_ids = {n["sample_id"]: n["depth"] for n in both["nodes"]}
+    assert node_ids == {"M": 0, "R1": 1, "R2": 1, "D1": 1, "D2": 1, "J": 2}
+    assert set(both["roots"]) == {"R1", "R2"}
+    assert set(both["leaves"]) == {"J"}
+
+
 def test_merge_into_existing_sample(client):
     client.post("/api/v1/operations/sampling", json={
         "type": "sampling", "op_no": "E1", "sample_id": "E-a",
